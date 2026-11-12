@@ -1,0 +1,111 @@
+We start 6 MongoDB programs on your Mac, each on its own port:
+  3 config servers  -> ports 27019, 27020, 27021  (they store the "map" of the data)
+  2 shard servers   -> ports 27018, 27028         (they store the data itself)
+  1 mongos router   -> port 27017                 (you connect here; it sends each
+                                                   query to the right shard)
+The & at the end of a command runs the program in the background, so ONE Terminal
+window is enough. Keep this Terminal window open until you finish (closing it stops them).
+(The --fork option from the task does not work on macOS in MongoDB 9.)
+
+STEP 0 - Stop the old server and make folders (Terminal)
+--------------------------------------------------------
+The router needs port 27017, which your normal server is using now.
+1) Go to the Terminal window where "mongod --dbpath ..." is running and press Ctrl + C.
+   (Close any mongosh windows too.)
+2) In Terminal:
+
+mkdir -p ~/mongodb-sharding/{configdb1,configdb2,configdb3,shard1,shard2,logs}
+cd ~/mongodb-sharding
+ls
+
+STEP 1 - Start the 3 config servers (Terminal)
+----------------------------------------------
+mongod --configsvr --replSet configReplSet --port 27019 --dbpath configdb1 --bind_ip localhost --logpath logs/configdb1.log &
+
+mongod --configsvr --replSet configReplSet --port 27020 --dbpath configdb2 --bind_ip localhost --logpath logs/configdb2.log &
+
+mongod --configsvr --replSet configReplSet --port 27021 --dbpath configdb3 --bind_ip localhost --logpath logs/configdb3.log &
+
+Each one prints a job number like  [1] 12345  and gives the prompt back.
+Press Enter if the prompt does not come back by itself.
+
+Initialize the config replica set:
+
+mongosh --port 27019 --eval 'rs.initiate({ _id: "configReplSet", configsvr: true, members: [ { _id: 0, host: "localhost:27019" }, { _id: 1, host: "localhost:27020" }, { _id: 2, host: "localhost:27021" } ] })'
+
+Expected: { ok: 1 }.  Wait about 10 seconds, then check:
+
+mongosh --port 27019 --quiet --eval 'rs.status().members.map(m => m.name + "  " + m.stateStr)'
+
+Expected: one PRIMARY and two SECONDARY.
+
+STEP 2 - Start the 2 shard servers (Terminal)
+---------------------------------------------
+mongod --shardsvr --replSet shard1 --port 27018 --dbpath shard1 --bind_ip localhost --logpath logs/shard1.log &
+
+mongod --shardsvr --replSet shard2 --port 27028 --dbpath shard2 --bind_ip localhost --logpath logs/shard2.log &
+
+Initialize each shard:
+
+mongosh --port 27018 --eval 'rs.initiate({ _id: "shard1", members: [ { _id: 0, host: "localhost:27018" } ] })'
+
+mongosh --port 27028 --eval 'rs.initiate({ _id: "shard2", members: [ { _id: 0, host: "localhost:27028" } ] })'
+
+Expected: { ok: 1 } twice.
+
+STEP 3 - Start the mongos router (Terminal)
+-------------------------------------------
+mongos --configdb configReplSet/localhost:27019,localhost:27020,localhost:27021 --bind_ip localhost --port 27017 --logpath logs/mongos.log &
+
+Check that all 6 are running:
+
+ps aux | grep -E "mongod|mongos" | grep -v grep
+
+STEP 4 - Add the shards and enable sharding (mongosh connected to mongos)
+-------------------------------------------------------------------------
+mongosh --port 27017
+
+Inside mongosh (the prompt says [direct: mongos]):
+
+sh.addShard("shard1/localhost:27018")
+
+sh.addShard("shard2/localhost:27028")
+
+sh.enableSharding("testdb")
+
+sh.shardCollection("testdb.collection", { shardKeyField: "hashed" })
+
+STEP 5 - Insert 100,000 documents and check the distribution (mongosh)
+----------------------------------------------------------------------
+use testdb
+
+for (let b = 0; b < 100; b++) { const docs = []; for (let i = b * 1000; i < (b + 1) * 1000; i++) { docs.push({ shardKeyField: i, data: "sample data " + i }); } db.getCollection("collection").insertMany(docs); } print("done");
+
+(this takes 10-30 seconds; wait for "done")
+
+db.getCollection("collection").countDocuments()
+
+db.getCollection("collection").getShardDistribution()
+
+sh.status()
+
+STEP 6 - Stop the cluster when you are done (Terminal)
+------------------------------------------------------
+Type exit to leave mongosh, then:
+
+mongosh --port 27017 --quiet --eval 'db.getSiblingDB("admin").shutdownServer()'
+mongosh --port 27018 --quiet --eval 'db.getSiblingDB("admin").shutdownServer()'
+mongosh --port 27028 --quiet --eval 'db.getSiblingDB("admin").shutdownServer()'
+mongosh --port 27021 --quiet --eval 'db.getSiblingDB("admin").shutdownServer()'
+mongosh --port 27020 --quiet --eval 'db.getSiblingDB("admin").shutdownServer()'
+mongosh --port 27019 --quiet --eval 'db.getSiblingDB("admin").shutdownServer()'
+
+(The "MongoNetworkError ... closed" messages are normal - the server stopped.)
+
+IF SOMETHING GOES WRONG
+-----------------------
+- "Address already in use" -> something already uses that port. For 27017 it is
+  the old server: stop it (Step 0). Check with:  lsof -i :27017
+- "ERROR: child process failed, exited with 1" -> read the log file, e.g.
+  tail -20 logs/configdb1.log   and read the last lines.
+- sh.enableSharding says it is not needed -> just continue with shardCollection.

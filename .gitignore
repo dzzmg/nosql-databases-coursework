@@ -1,0 +1,5 @@
+data/
+rejected_rows.csv
+out.json
+*.log
+.DS_Store
